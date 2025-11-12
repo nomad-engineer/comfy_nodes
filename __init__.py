@@ -7,6 +7,7 @@ from .lora import LoraStackerTrigger, LoraStackGetTriggerWords
 from .multivalue import ComplexValueNode
 from .promptFromTagFiles import prompt_from_tag_files
 from .promptAssembley import prompt_assemble
+from .modelDownloader import ModelDownloader
 
 # Imports from myCustomNodes2
 from .nodes2 import MyPipeAll, pipeAdd, pipeRead, pipeReadKeyword, Sequential_Image_Loader, \
@@ -27,6 +28,7 @@ NODE_CLASS_MAPPINGS = {
          "Multi_value_node": ComplexValueNode,
          "Prompt from Tag Files": prompt_from_tag_files,
          "Prompt Assemble": prompt_assemble,
+         "Model Downloader": ModelDownloader,
 
          # From myCustomNodes2
          "My Pipe All": MyPipeAll,
@@ -55,6 +57,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
       "ControlNet_stacker": "ControlNet_stacker",
       "Lora_Stacker_Trigger": "Lora_Stacker_Trigger",
       "Lora_Stack_Get_Trigger_Words": "Lora_Stack_Get_Trigger_Words",
+      "Model Downloader": "Model Downloader",
 
       # From myCustomNodes2
       "My Pipe All": "MyPipeAll",
