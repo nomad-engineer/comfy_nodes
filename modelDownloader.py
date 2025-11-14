@@ -4,6 +4,8 @@ import tempfile
 import shutil
 from pathlib import Path
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import folder_paths
 
 
@@ -24,6 +26,7 @@ class ModelDownloader:
                     "multiline": True,
                     "default": "# Format: folder, url, optional_filename\n# Examples:\n# Single file: checkpoints, https://example.com/model.safetensors\n# Single file with custom name: loras, https://example.com/lora.safetensors, my_lora.safetensors\n# Folder: loras, https://server/models/loras/"
                 }),
+                "concurrent_downloads": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
                 "force_redownload": ("BOOLEAN", {"default": False}),
                 "recursive_download": ("BOOLEAN", {"default": False}),
                 "disable_download": ("BOOLEAN", {"default": False}),
@@ -302,7 +305,90 @@ class ModelDownloader:
                 except:
                     pass
 
-    def download_models(self, model_list, force_redownload, recursive_download, disable_download):
+    def process_single_download(self, line, force_redownload, recursive_download, print_lock):
+        """
+        Process a single download entry (file or folder).
+        Returns (success_count, skip_count, fail_count).
+        """
+        result = self.parse_url_entry(line)
+        if not result:
+            with print_lock:
+                print(f"⚠ Skipping invalid entry: {line}")
+            return 0, 0, 1
+
+        folder, url, custom_filename = result
+
+        # Get destination directory
+        dest_dir = self.get_model_dir(folder)
+
+        # Check if URL is a folder or a file
+        if self.is_folder_url(url):
+            # Folder download
+            with print_lock:
+                print(f"Processing folder: {url}")
+                print(f"  Target folder: {folder}")
+                print(f"  Destination: {dest_dir}")
+
+            folder_success, folder_skip = self.download_folder(
+                url, dest_dir, recursive=recursive_download, force_redownload=force_redownload
+            )
+
+            with print_lock:
+                print()  # Empty line after entry
+
+            if folder_success == 0 and folder_skip == 0:
+                return 0, 0, 1
+            else:
+                return folder_success, folder_skip, 0
+
+        else:
+            # Single file download
+            # Determine filename
+            if custom_filename:
+                filename = custom_filename
+            else:
+                filename = self.get_filename_from_url(url)
+
+            dest_file = dest_dir / filename
+
+            with print_lock:
+                print(f"Processing file: {filename}")
+                print(f"  Target folder: {folder}")
+                print(f"  Destination: {dest_file}")
+
+            # Check if file exists
+            if dest_file.exists() and not force_redownload:
+                with print_lock:
+                    print(f"  ✓ File already exists, skipping")
+                    print()
+                return 0, 1, 0
+
+            if dest_file.exists() and force_redownload:
+                with print_lock:
+                    print(f"  ⚠ File exists but force_redownload is enabled")
+                # Remove existing file
+                try:
+                    dest_file.unlink()
+                    with print_lock:
+                        print(f"  → Removed existing file")
+                except Exception as e:
+                    with print_lock:
+                        print(f"  ✗ Failed to remove existing file: {e}")
+                        print()
+                    return 0, 0, 1
+
+            # Download the file
+            success = self.download_file_with_temp(url, dest_file)
+
+            with print_lock:
+                print()  # Empty line after entry
+
+            if success:
+                return 1, 0, 0
+            else:
+                return 0, 0, 1
+
+    def download_models(self, model_list, concurrent_downloads, force_redownload, recursive_download, disable_download):
         """Main function to process and download models."""
 
         if disable_download:
@@ -315,96 +401,64 @@ class ModelDownloader:
         if not lines:
             return ("No models to download",)
 
-        results = []
-        success_count = 0
-        skip_count = 0
-        fail_count = 0
-
         print(f"\n{'='*60}")
         print(f"Model Downloader - Processing {len(lines)} entries")
+        print(f"Concurrent downloads: {concurrent_downloads}")
         print(f"Force redownload: {force_redownload}")
         print(f"Recursive download: {recursive_download}")
         print(f"{'='*60}\n")
 
-        for line in lines:
-            result = self.parse_url_entry(line)
-            if not result:
-                print(f"⚠ Skipping invalid entry: {line}")
-                fail_count += 1
-                continue
+        # Thread-safe printing
+        print_lock = threading.Lock()
 
-            folder, url, custom_filename = result
+        # Total counters
+        total_success = 0
+        total_skip = 0
+        total_fail = 0
 
-            # Get destination directory
-            dest_dir = self.get_model_dir(folder)
-
-            # Check if URL is a folder or a file
-            if self.is_folder_url(url):
-                # Folder download
-                print(f"Processing folder: {url}")
-                print(f"  Target folder: {folder}")
-                print(f"  Destination: {dest_dir}")
-
-                folder_success, folder_skip = self.download_folder(
-                    url, dest_dir, recursive=recursive_download, force_redownload=force_redownload
+        # Use ThreadPoolExecutor for concurrent downloads
+        if concurrent_downloads == 1:
+            # Sequential processing (no threading overhead)
+            for line in lines:
+                success, skip, fail = self.process_single_download(
+                    line, force_redownload, recursive_download, print_lock
                 )
+                total_success += success
+                total_skip += skip
+                total_fail += fail
+        else:
+            # Concurrent processing
+            with ThreadPoolExecutor(max_workers=concurrent_downloads) as executor:
+                # Submit all download tasks
+                futures = {
+                    executor.submit(
+                        self.process_single_download,
+                        line,
+                        force_redownload,
+                        recursive_download,
+                        print_lock
+                    ): line for line in lines
+                }
 
-                success_count += folder_success
-                skip_count += folder_skip
-
-                if folder_success == 0 and folder_skip == 0:
-                    fail_count += 1
-
-            else:
-                # Single file download
-                # Determine filename
-                if custom_filename:
-                    filename = custom_filename
-                else:
-                    filename = self.get_filename_from_url(url)
-
-                dest_file = dest_dir / filename
-
-                print(f"Processing file: {filename}")
-                print(f"  Target folder: {folder}")
-                print(f"  Destination: {dest_file}")
-
-                # Check if file exists
-                if dest_file.exists() and not force_redownload:
-                    print(f"  ✓ File already exists, skipping")
-                    skip_count += 1
-                    print()
-                    continue
-
-                if dest_file.exists() and force_redownload:
-                    print(f"  ⚠ File exists but force_redownload is enabled")
-                    # Remove existing file
+                # Collect results as they complete
+                for future in as_completed(futures):
                     try:
-                        dest_file.unlink()
-                        print(f"  → Removed existing file")
+                        success, skip, fail = future.result()
+                        total_success += success
+                        total_skip += skip
+                        total_fail += fail
                     except Exception as e:
-                        print(f"  ✗ Failed to remove existing file: {e}")
-                        fail_count += 1
-                        print()
-                        continue
-
-                # Download the file
-                success = self.download_file_with_temp(url, dest_file)
-
-                if success:
-                    success_count += 1
-                else:
-                    fail_count += 1
-
-            print()  # Empty line between entries
+                        with print_lock:
+                            print(f"✗ Unexpected error: {e}")
+                        total_fail += 1
 
         # Summary
         print(f"{'='*60}")
         print(f"Download Summary:")
-        print(f"  ✓ Successfully downloaded: {success_count}")
-        print(f"  → Skipped (already exists): {skip_count}")
-        print(f"  ✗ Failed: {fail_count}")
+        print(f"  ✓ Successfully downloaded: {total_success}")
+        print(f"  → Skipped (already exists): {total_skip}")
+        print(f"  ✗ Failed: {total_fail}")
         print(f"{'='*60}\n")
 
-        status = f"Downloaded: {success_count}, Skipped: {skip_count}, Failed: {fail_count}"
+        status = f"Downloaded: {total_success}, Skipped: {total_skip}, Failed: {total_fail}"
         return (status,)
