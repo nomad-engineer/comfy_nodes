@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import folder_paths
@@ -11,12 +11,35 @@ import requests
 from tqdm import tqdm
 import comfy.utils
 import comfy.model_management
+import fnmatch
+import re
+
+# Try to import BeautifulSoup, but don't fail if it's not available
+try:
+    from bs4 import BeautifulSoup
+
+    HAS_BEAUTIFULSOUP = True
+except ImportError:
+    HAS_BEAUTIFULSOUP = False
+    print(
+        "Warning: BeautifulSoup4 not found. Wildcard matching will use regex fallback."
+    )
+    print("For better wildcard support, install: pip install beautifulsoup4")
 
 
 class ModelDownloader:
     """
     A ComfyUI node that downloads model files to the ComfyUI models directory.
     Supports CSV format: folder, url, custom_filename
+
+    Features:
+    - Single file downloads
+    - Folder downloads (recursive or non-recursive)
+    - Wildcard URL patterns (e.g., https://server/path/*.safetensors)
+    - Progress bar in ComfyUI UI
+    - Cancellation support
+    - HTTP authentication (username/password)
+    - Concurrent downloads
     """
 
     def __init__(self):
@@ -35,11 +58,17 @@ class ModelDownloader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_list": ("STRING", {
-                    "multiline": True,
-                    "default": "# Format: folder, url, optional_filename\n# Examples:\n# Single file: checkpoints, https://example.com/model.safetensors\n# Single file with custom name: loras, https://example.com/lora.safetensors, my_lora.safetensors\n# Folder: loras, https://server/models/loras/"
-                }),
-                "concurrent_downloads": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
+                "model_list": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "# Format: folder, url, optional_filename\n# Examples:\n# Single file: checkpoints, https://example.com/model.safetensors\n# Single file with custom name: loras, https://example.com/lora.safetensors, my_lora.safetensors\n# Folder: loras, https://server/models/loras/\n# Wildcard: loras, https://server/models/loras/*.safetensors",
+                    },
+                ),
+                "concurrent_downloads": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 10, "step": 1},
+                ),
                 "force_redownload": ("BOOLEAN", {"default": False}),
                 "recursive_download": ("BOOLEAN", {"default": False}),
                 "disable_download": ("BOOLEAN", {"default": False}),
@@ -58,7 +87,7 @@ class ModelDownloader:
 
     def parse_url_entry(self, line):
         """Parse a CSV line into folder, url, and optional filename."""
-        parts = [p.strip() for p in line.strip().split(',')]
+        parts = [p.strip() for p in line.strip().split(",")]
         if len(parts) < 2:
             return None
 
@@ -72,9 +101,114 @@ class ModelDownloader:
         """Extract filename from URL, removing query parameters."""
         parsed = urlparse(url)
         filename = os.path.basename(parsed.path)
-        if '?' in filename:
-            filename = filename.split('?')[0]
+        if "?" in filename:
+            filename = filename.split("?")[0]
         return filename
+
+    def has_wildcard(self, url):
+        """Check if a URL contains wildcard characters (* or ?)."""
+        return "*" in url or "?" in url
+
+    def find_wildcard_matches(self, url_with_wildcard):
+        """
+        Performs a wildcard search on a remote HTTP directory listing to find matching files.
+        Returns list of tuples: (filename, full_url, size)
+        """
+        print(f"\n--- Wildcard URL Detection ---")
+        print(f"Processing wildcard URL: {url_with_wildcard}")
+
+        # Separate the base URL from the filename pattern
+        path_index = url_with_wildcard.rfind("/")
+        if path_index == -1:
+            print("Error: Invalid URL format. Could not find path separator.")
+            return []
+
+        base_url = url_with_wildcard[: path_index + 1]
+        pattern = url_with_wildcard[path_index + 1 :]
+
+        if not pattern or ("*" not in pattern and "?" not in pattern):
+            print(f"Warning: No valid wildcard found in pattern: '{pattern}'.")
+            return []
+
+        print(f"  Base Directory URL: {base_url}")
+        print(f"  Wildcard Pattern: {pattern}")
+
+        # Fetch the directory listing HTML
+        try:
+            headers = {"User-Agent": "ComfyUI-ModelDownloader/1.0"}
+            auth = None
+            if self.username and self.password:
+                auth = (self.username, self.password)
+
+            response = requests.get(base_url, headers=headers, auth=auth, timeout=30)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching URL {base_url}: {e}")
+            return []
+
+        # Parse the HTML content
+        matching_files = []
+
+        # Use BeautifulSoup if available, otherwise fall back to regex
+        if HAS_BEAUTIFULSOUP:
+            soup = BeautifulSoup(response.content, "html.parser")
+            links = []
+            for link in soup.find_all("a"):
+                href = link.get("href")
+                if href:
+                    # Handle both string and list cases
+                    if isinstance(href, list):
+                        links.extend(href)
+                    else:
+                        links.append(str(href))
+        else:
+            # Regex fallback for HTML parsing
+            href_pattern = r'href=["\']([^"\']+)["\']'
+            links = re.findall(href_pattern, response.text)
+
+        for href in links:
+            # Skip invalid links
+            if (
+                not href
+                or href in [".", "..", "/", "#"]
+                or href.startswith("?")
+                or href.startswith("#")
+            ):
+                continue
+
+            # URL decode and extract filename
+            from urllib.parse import unquote
+
+            decoded_href = unquote(str(href))
+            filename = decoded_href.split("/")[-1].split("?")[0]
+
+            # Skip if no filename or doesn't match pattern
+            if not filename or not fnmatch.fnmatch(filename, pattern):
+                continue
+
+            # Construct full URL - handle different href formats
+            href_str = str(href)
+            if href_str.startswith("http://") or href_str.startswith("https://"):
+                full_url = href_str
+            elif href_str.startswith("/"):
+                # Absolute path - construct from base URL domain
+                parsed_base = urlparse(base_url)
+                full_url = f"{parsed_base.scheme}://{parsed_base.netloc}{href_str}"
+            else:
+                # Relative path - join with base URL properly
+                full_url = urljoin(base_url, href_str)
+
+            print(f"  ✓ Match: {filename}")
+            print(f"    href='{href_str}' -> {full_url}")
+
+            size = self.get_file_size(full_url)
+            size_str = f"{size / (1024 * 1024):.2f} MB" if size > 0 else "unknown size"
+            print(f"    Size: {size_str}")
+
+            matching_files.append((filename, full_url, size))
+
+        print(f"  Total matches: {len(matching_files)}")
+        return matching_files
 
     def is_folder_url(self, url):
         """
@@ -82,17 +216,22 @@ class ModelDownloader:
         Heuristics:
         - Ends with /
         - No file extension in the last path component
+        - Does not contain wildcards (wildcards are handled separately)
         """
+        # Wildcard URLs are not folder URLs
+        if self.has_wildcard(url):
+            return False
+
         parsed = urlparse(url)
-        path = parsed.path.rstrip('/')
+        path = parsed.path.rstrip("/")
 
         # If URL explicitly ends with /, it's a folder
-        if parsed.path.endswith('/'):
+        if parsed.path.endswith("/"):
             return True
 
         # Check if the last component has a file extension
         filename = os.path.basename(path)
-        if '.' in filename:
+        if "." in filename:
             # Has extension, likely a file
             return False
         else:
@@ -121,9 +260,18 @@ class ModelDownloader:
             if self.username and self.password:
                 auth = (self.username, self.password)
             response = requests.head(url, allow_redirects=True, timeout=10, auth=auth)
-            if 'content-length' in response.headers:
-                return int(response.headers['content-length'])
-        except:
+            response.raise_for_status()
+            if "content-length" in response.headers:
+                return int(response.headers["content-length"])
+            # If HEAD doesn't return content-length, try GET with stream
+            response = requests.get(
+                url, allow_redirects=True, timeout=10, auth=auth, stream=True
+            )
+            response.raise_for_status()
+            if "content-length" in response.headers:
+                return int(response.headers["content-length"])
+        except Exception as e:
+            # Silently fail - size is optional
             pass
         return 0
 
@@ -133,29 +281,53 @@ class ModelDownloader:
         Returns list of tuples: (filename, url, estimated_size)
         """
         model_extensions = [
-            'safetensors', 'ckpt', 'pt', 'pth', 'bin',
-            'onnx', 'pb', 'h5', 'tflite', 'msgpack'
+            "safetensors",
+            "ckpt",
+            "pt",
+            "pth",
+            "bin",
+            "onnx",
+            "pb",
+            "h5",
+            "tflite",
+            "msgpack",
         ]
 
         files = []
         try:
-            # Try to parse directory listing
             auth = None
             if self.username and self.password:
                 auth = (self.username, self.password)
+
             response = requests.get(url, timeout=30, auth=auth)
-            if response.status_code == 200:
-                import re
-                # Simple pattern to find links to model files
-                for ext in model_extensions:
-                    pattern = rf'href=["\']([^"\']*\.{ext})["\']'
-                    matches = re.findall(pattern, response.text, re.IGNORECASE)
-                    for match in matches:
-                        file_url = match if match.startswith('http') else url.rstrip('/') + '/' + match.lstrip('/')
-                        filename = os.path.basename(file_url.split('?')[0])
-                        size = self.get_file_size(file_url)
-                        files.append((filename, file_url, size))
-        except:
+            response.raise_for_status()
+
+            # Find all href links in the HTML
+            href_pattern = r'href=["\']([^"\']+)["\']'
+            hrefs = re.findall(href_pattern, response.text, re.IGNORECASE)
+
+            for href in hrefs:
+                # Skip invalid links
+                if not href or href.startswith("?") or href.startswith("#"):
+                    continue
+
+                # Check if link ends with a model extension
+                href_lower = href.lower()
+                if any(href_lower.endswith(f".{ext}") for ext in model_extensions):
+                    # Construct full URL
+                    if href.startswith("http"):
+                        file_url = href
+                    elif href.startswith("/"):
+                        parsed = urlparse(url)
+                        file_url = f"{parsed.scheme}://{parsed.netloc}{href}"
+                    else:
+                        file_url = url.rstrip("/") + "/" + href.lstrip("/")
+
+                    filename = os.path.basename(file_url.split("?")[0])
+                    size = self.get_file_size(file_url)
+                    files.append((filename, file_url, size))
+
+        except Exception:
             pass
 
         return files
@@ -175,34 +347,59 @@ class ModelDownloader:
             folder, url, custom_filename = result
             dest_dir = self.get_model_dir(folder)
 
-            if self.is_folder_url(url):
+            if self.has_wildcard(url):
+                # Wildcard URL - find all matching files
+                print(f"\nProcessing wildcard pattern for folder '{folder}'")
+                wildcard_files = self.find_wildcard_matches(url)
+                for filename, file_url, size in wildcard_files:
+                    dest_path = dest_dir / filename
+                    if not dest_path.exists() or force_redownload:
+                        tasks.append(
+                            {
+                                "folder": folder,
+                                "filename": filename,
+                                "url": file_url,
+                                "dest_path": dest_path,
+                                "size": size,
+                                "is_wildcard_match": True,
+                            }
+                        )
+            elif self.is_folder_url(url):
                 # Folder - get all files from it
                 folder_files = self.get_folder_files_listing(url)
                 for filename, file_url, size in folder_files:
                     dest_path = dest_dir / filename
                     if not dest_path.exists() or force_redownload:
-                        tasks.append({
-                            'folder': folder,
-                            'filename': filename,
-                            'url': file_url,
-                            'dest_path': dest_path,
-                            'size': size,
-                            'is_folder_item': True
-                        })
+                        tasks.append(
+                            {
+                                "folder": folder,
+                                "filename": filename,
+                                "url": file_url,
+                                "dest_path": dest_path,
+                                "size": size,
+                                "is_folder_item": True,
+                            }
+                        )
             else:
                 # Single file
-                filename = custom_filename if custom_filename else self.get_filename_from_url(url)
+                filename = (
+                    custom_filename
+                    if custom_filename
+                    else self.get_filename_from_url(url)
+                )
                 dest_path = dest_dir / filename
                 if not dest_path.exists() or force_redownload:
                     size = self.get_file_size(url)
-                    tasks.append({
-                        'folder': folder,
-                        'filename': filename,
-                        'url': url,
-                        'dest_path': dest_path,
-                        'size': size,
-                        'is_folder_item': False
-                    })
+                    tasks.append(
+                        {
+                            "folder": folder,
+                            "filename": filename,
+                            "url": url,
+                            "dest_path": dest_path,
+                            "size": size,
+                            "is_folder_item": False,
+                        }
+                    )
 
         return tasks
 
@@ -226,23 +423,28 @@ class ModelDownloader:
         try:
             # Create temp file with a unique name in the destination directory
             with tempfile.NamedTemporaryFile(
-                mode='wb',
+                mode="wb",
                 delete=False,
                 dir=dest_dir,
-                prefix='.download_',
-                suffix='.tmp'
+                prefix=".download_",
+                suffix=".tmp",
             ) as tf:
                 temp_file = Path(tf.name)
 
             print(f"  → Downloading to temporary file...")
+            print(f"  → URL: {url}")
 
             # Try aria2c first (faster, multi-connection)
-            success, process = self.download_with_aria2c(url, temp_file, progress_callback)
+            success, process = self.download_with_aria2c(
+                url, temp_file, progress_callback
+            )
 
             # Fall back to wget if aria2c is not available
             if success is None:
                 print(f"  → aria2c not found, falling back to wget...")
-                success, process = self.download_with_wget(url, temp_file, progress_callback)
+                success, process = self.download_with_wget(
+                    url, temp_file, progress_callback
+                )
 
             if success:
                 # Verify the downloaded file is not empty
@@ -287,78 +489,122 @@ class ModelDownloader:
         """Download using aria2c (fast, multi-connection)."""
         try:
             cmd = [
-                'aria2c',
-                '-x', '16',  # 16 connections
-                '-s', '16',  # 16 segments
-                '-c',  # continue
-                '--file-allocation=none',
-                '--max-tries=0',
-                '--retry-wait=5',
-                '--timeout=60',
-                '--allow-overwrite=true',
-                '--auto-file-renaming=false',
+                "aria2c",
+                "-x",
+                "16",
+                "-s",
+                "16",  # 16 connections/segments
+                "-c",  # continue
+                "--file-allocation=none",
+                "--max-tries=0",
+                "--retry-wait=5",
+                "--timeout=60",
+                "--allow-overwrite=true",
+                "--auto-file-renaming=false",
             ]
 
             # Add authentication if provided
             if self.username and self.password:
-                cmd.extend(['--http-user', self.username])
-                cmd.extend(['--http-passwd', self.password])
+                cmd.extend(
+                    ["--http-user", self.username, "--http-passwd", self.password]
+                )
 
-            cmd.extend([
-                '-o', dest_path.name,
-                '-d', str(dest_path.parent),
-                url
-            ])
+            cmd.extend(["-o", dest_path.name, "-d", str(dest_path.parent), url])
 
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return self._run_download_process(cmd, "aria2c")
 
-            # Wait for completion while checking for cancellation
-            while process.poll() is None:
-                if self.check_interruption():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    return False, process
-                # Small sleep to avoid busy waiting
-                import time
-                time.sleep(0.1)
-
-            if process.returncode == 0:
-                return True, process
-            else:
-                print(f"  aria2c error: return code {process.returncode}")
-                return False, process
         except FileNotFoundError:
             return None, None  # Signal to try wget
-        except Exception as e:
-            print(f"  aria2c exception: {e}")
-            return False, None
 
     def download_with_wget(self, url, dest_path, progress_callback=None):
         """Download using wget."""
         try:
             cmd = [
-                'wget',
-                '-c',  # continue
-                '-t', '3',  # 3 retries
-                '--timeout=30',
-                '--read-timeout=30',
-                '--progress=bar:force',
+                "wget",
+                "-c",  # continue
+                "-t",
+                "3",  # 3 retries
+                "--timeout=30",
+                "--read-timeout=30",
+                "--progress=bar:force",
             ]
 
             # Add authentication if provided
             if self.username and self.password:
-                cmd.extend(['--user', self.username])
-                cmd.extend(['--password', self.password])
+                cmd.extend(["--user", self.username, "--password", self.password])
 
-            cmd.extend([
-                url,
-                '-O', str(dest_path)
-            ])
+            cmd.extend([url, "-O", str(dest_path)])
 
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return self._run_download_process(cmd, "wget")
+
+        except FileNotFoundError:
+            print(f"  Error: wget not found. Please install wget or aria2c.")
+            return False, None
+
+    def _run_download_process(self, cmd, tool_name):
+        """Common method to run download processes with cancellation support."""
+        import time
+
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Wait for completion while checking for cancellation
+        while process.poll() is None:
+            if self.check_interruption():
+                self._terminate_process(process)
+                return False, process
+            time.sleep(0.1)
+
+        if process.returncode == 0:
+            return True, process
+        else:
+            # Print stderr output for debugging
+            stderr_output = (
+                process.stderr.read().decode("utf-8", errors="ignore")
+                if process.stderr
+                else ""
+            )
+            print(f"  {tool_name} error: return code {process.returncode}")
+            if stderr_output:
+                # Print first few lines of error
+                error_lines = stderr_output.strip().split("\n")[:3]
+                for line in error_lines:
+                    print(f"    {line}")
+            return False, process
+
+    def _terminate_process(self, process):
+        """Safely terminate a process."""
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except:
+                pass
+
+    def download_with_wget(self, url, dest_path, progress_callback=None):
+        """Download using wget."""
+        try:
+            cmd = [
+                "wget",
+                "-c",  # continue
+                "-t",
+                "3",  # 3 retries
+                "--timeout=30",
+                "--read-timeout=30",
+                "--progress=bar:force",
+            ]
+
+            # Add authentication if provided
+            if self.username and self.password:
+                cmd.extend(["--user", self.username])
+                cmd.extend(["--password", self.password])
+
+            cmd.extend([url, "-O", str(dest_path)])
+
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
 
             # Wait for completion while checking for cancellation
             while process.poll() is None:
@@ -371,12 +617,24 @@ class ModelDownloader:
                     return False, process
                 # Small sleep to avoid busy waiting
                 import time
+
                 time.sleep(0.1)
 
             if process.returncode == 0:
                 return True, process
             else:
+                # Print stderr output for debugging
+                stderr_output = (
+                    process.stderr.read().decode("utf-8", errors="ignore")
+                    if process.stderr
+                    else ""
+                )
                 print(f"  wget error: return code {process.returncode}")
+                if stderr_output:
+                    # Print first few lines of error
+                    error_lines = stderr_output.strip().split("\n")[:5]
+                    for line in error_lines:
+                        print(f"    {line}")
                 return False, process
         except FileNotFoundError:
             print(f"  Error: wget not found. Please install wget or aria2c.")
@@ -392,55 +650,67 @@ class ModelDownloader:
         """
         # Model file extensions to download
         model_extensions = [
-            'safetensors', 'ckpt', 'pt', 'pth', 'bin',
-            'onnx', 'pb', 'h5', 'tflite', 'msgpack'
+            "safetensors",
+            "ckpt",
+            "pt",
+            "pth",
+            "bin",
+            "onnx",
+            "pb",
+            "h5",
+            "tflite",
+            "msgpack",
         ]
 
         # Create temp directory for download
         temp_dir = None
         try:
-            temp_dir = tempfile.mkdtemp(prefix='model_download_')
+            temp_dir = tempfile.mkdtemp(prefix="model_download_")
             temp_path = Path(temp_dir)
 
             print(f"  → Downloading folder contents to temp directory...")
 
             # Build wget command
             wget_cmd = [
-                'wget',
-                '-r',  # recursive
-                '--no-parent',  # don't ascend to parent directory
-                '--no-host-directories',  # don't create host directory
-                '--cut-dirs=999',  # flatten directory structure
-                '-t', '3',  # 3 retries
-                '--timeout=30',
-                '--read-timeout=30',
-                '--progress=bar:force',
-                '-P', str(temp_path),  # download to temp directory
+                "wget",
+                "-r",  # recursive
+                "--no-parent",  # don't ascend to parent directory
+                "--no-host-directories",  # don't create host directory
+                "--cut-dirs=999",  # flatten directory structure
+                "-t",
+                "3",  # 3 retries
+                "--timeout=30",
+                "--read-timeout=30",
+                "--progress=bar:force",
+                "-P",
+                str(temp_path),  # download to temp directory
             ]
 
             # Add recursive flag
             if not recursive:
-                wget_cmd.append('-l')  # level
-                wget_cmd.append('1')  # only 1 level (no subdirectories)
+                wget_cmd.append("-l")  # level
+                wget_cmd.append("1")  # only 1 level (no subdirectories)
 
             # Add accept pattern for model files
-            accept_pattern = ','.join([f'*.{ext}' for ext in model_extensions])
-            wget_cmd.append('-A')
+            accept_pattern = ",".join([f"*.{ext}" for ext in model_extensions])
+            wget_cmd.append("-A")
             wget_cmd.append(accept_pattern)
 
             # Reject common non-model files
-            wget_cmd.append('-R')
-            wget_cmd.append('index.html*,*.tmp,*.txt,*.md')
+            wget_cmd.append("-R")
+            wget_cmd.append("index.html*,*.tmp,*.txt,*.md")
 
             wget_cmd.append(url)
 
             # Execute wget
-            result = subprocess.run(wget_cmd, check=True, capture_output=True, text=True)
+            result = subprocess.run(
+                wget_cmd, check=True, capture_output=True, text=True
+            )
 
             # Find all downloaded model files
             downloaded_files = []
             for ext in model_extensions:
-                downloaded_files.extend(temp_path.rglob(f'*.{ext}'))
+                downloaded_files.extend(temp_path.rglob(f"*.{ext}"))
 
             if not downloaded_files:
                 print(f"  ⚠ No model files found in folder")
@@ -490,90 +760,16 @@ class ModelDownloader:
                 except:
                     pass
 
-    def process_single_download(self, line, force_redownload, recursive_download, print_lock):
-        """
-        Process a single download entry (file or folder).
-        Returns (success_count, skip_count, fail_count).
-        """
-        result = self.parse_url_entry(line)
-        if not result:
-            with print_lock:
-                print(f"⚠ Skipping invalid entry: {line}")
-            return 0, 0, 1
-
-        folder, url, custom_filename = result
-
-        # Get destination directory
-        dest_dir = self.get_model_dir(folder)
-
-        # Check if URL is a folder or a file
-        if self.is_folder_url(url):
-            # Folder download
-            with print_lock:
-                print(f"Processing folder: {url}")
-                print(f"  Target folder: {folder}")
-                print(f"  Destination: {dest_dir}")
-
-            folder_success, folder_skip = self.download_folder(
-                url, dest_dir, recursive=recursive_download, force_redownload=force_redownload
-            )
-
-            with print_lock:
-                print()  # Empty line after entry
-
-            if folder_success == 0 and folder_skip == 0:
-                return 0, 0, 1
-            else:
-                return folder_success, folder_skip, 0
-
-        else:
-            # Single file download
-            # Determine filename
-            if custom_filename:
-                filename = custom_filename
-            else:
-                filename = self.get_filename_from_url(url)
-
-            dest_file = dest_dir / filename
-
-            with print_lock:
-                print(f"Processing file: {filename}")
-                print(f"  Target folder: {folder}")
-                print(f"  Destination: {dest_file}")
-
-            # Check if file exists
-            if dest_file.exists() and not force_redownload:
-                with print_lock:
-                    print(f"  ✓ File already exists, skipping")
-                    print()
-                return 0, 1, 0
-
-            if dest_file.exists() and force_redownload:
-                with print_lock:
-                    print(f"  ⚠ File exists but force_redownload is enabled")
-                # Remove existing file
-                try:
-                    dest_file.unlink()
-                    with print_lock:
-                        print(f"  → Removed existing file")
-                except Exception as e:
-                    with print_lock:
-                        print(f"  ✗ Failed to remove existing file: {e}")
-                        print()
-                    return 0, 0, 1
-
-            # Download the file
-            success = self.download_file_with_temp(url, dest_file)
-
-            with print_lock:
-                print()  # Empty line after entry
-
-            if success:
-                return 1, 0, 0
-            else:
-                return 0, 0, 1
-
-    def download_models(self, model_list, concurrent_downloads, force_redownload, recursive_download, disable_download, username="", password=""):
+    def download_models(
+        self,
+        model_list,
+        concurrent_downloads,
+        force_redownload,
+        recursive_download,
+        disable_download,
+        username="",
+        password="",
+    ):
         """Main function to process and download models."""
 
         # Reset cancellation flag and set credentials
@@ -585,15 +781,18 @@ class ModelDownloader:
             return ("Downloads disabled by user",)
 
         # Parse the model list
-        lines = [line.strip() for line in model_list.split('\n')
-                 if line.strip() and not line.strip().startswith('#')]
+        lines = [
+            line.strip()
+            for line in model_list.split("\n")
+            if line.strip() and not line.strip().startswith("#")
+        ]
 
         if not lines:
             return ("No models to download",)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Model Downloader - Collecting file listings...")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
         # Phase 1: Collect all download tasks
         try:
@@ -607,18 +806,18 @@ class ModelDownloader:
             return ("No files to download",)
 
         # Print full file listing
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Files to download: {len(tasks)}")
-        print(f"{'='*60}")
-        total_size = sum(task['size'] for task in tasks)
+        print(f"{'=' * 60}")
+        total_size = sum(task["size"] for task in tasks)
         for i, task in enumerate(tasks, 1):
-            size_mb = task['size'] / (1024 * 1024) if task['size'] > 0 else 0
+            size_mb = task["size"] / (1024 * 1024) if task["size"] > 0 else 0
             size_str = f"{size_mb:.2f} MB" if size_mb > 0 else "unknown size"
             print(f"{i}. {task['filename']} ({size_str})")
             print(f"   → {task['folder']}")
         print(f"\nTotal size: {total_size / (1024 * 1024):.2f} MB")
         print(f"Concurrent downloads: {concurrent_downloads}")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
         # Phase 2: Initialize progress bar
         self.progress_bar = comfy.utils.ProgressBar(len(tasks))
@@ -640,12 +839,14 @@ class ModelDownloader:
                 return False
 
             with print_lock:
-                print(f"\n[{task_index + 1}/{len(tasks)}] Downloading: {task['filename']}")
+                print(
+                    f"\n[{task_index + 1}/{len(tasks)}] Downloading: {task['filename']}"
+                )
                 print(f"  Target folder: {task['folder']}")
                 print(f"  Destination: {task['dest_path']}")
 
             # Download the file
-            success = self.download_file_with_temp(task['url'], task['dest_path'])
+            success = self.download_file_with_temp(task["url"], task["dest_path"])
 
             # Update progress
             with progress_lock:
@@ -704,13 +905,13 @@ class ModelDownloader:
             print(f"\n✗ Unexpected error during downloads: {e}")
 
         # Summary
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Download Summary:")
         print(f"  ✓ Successfully downloaded: {total_success}")
         print(f"  ✗ Failed: {total_fail}")
         if self.cancel_requested:
             print(f"  ⚠ Cancelled: {len(tasks) - total_success - total_fail}")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
         status = f"Downloaded: {total_success}, Failed: {total_fail}"
         if self.cancel_requested:
