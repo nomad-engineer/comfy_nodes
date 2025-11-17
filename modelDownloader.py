@@ -7,6 +7,10 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import folder_paths
+import requests
+from tqdm import tqdm
+import comfy.utils
+import comfy.model_management
 
 
 class ModelDownloader:
@@ -16,7 +20,16 @@ class ModelDownloader:
     """
 
     def __init__(self):
-        pass
+        self.cancel_requested = False
+        self.progress_bar = None
+        self.username = ""
+        self.password = ""
+
+    def check_interruption(self):
+        """Check if ComfyUI workflow has been interrupted."""
+        if comfy.model_management.processing_interrupted():
+            self.cancel_requested = True
+        return self.cancel_requested
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -30,6 +43,10 @@ class ModelDownloader:
                 "force_redownload": ("BOOLEAN", {"default": False}),
                 "recursive_download": ("BOOLEAN", {"default": False}),
                 "disable_download": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "username": ("STRING", {"default": ""}),
+                "password": ("STRING", {"default": ""}),
             },
         }
 
@@ -97,17 +114,115 @@ class ModelDownloader:
         models_dir.mkdir(parents=True, exist_ok=True)
         return models_dir
 
-    def download_file_with_temp(self, url, dest_path):
+    def get_file_size(self, url):
+        """Get the size of a file from URL headers."""
+        try:
+            auth = None
+            if self.username and self.password:
+                auth = (self.username, self.password)
+            response = requests.head(url, allow_redirects=True, timeout=10, auth=auth)
+            if 'content-length' in response.headers:
+                return int(response.headers['content-length'])
+        except:
+            pass
+        return 0
+
+    def get_folder_files_listing(self, url, recursive=False):
+        """
+        Get a list of model files from a folder URL.
+        Returns list of tuples: (filename, url, estimated_size)
+        """
+        model_extensions = [
+            'safetensors', 'ckpt', 'pt', 'pth', 'bin',
+            'onnx', 'pb', 'h5', 'tflite', 'msgpack'
+        ]
+
+        files = []
+        try:
+            # Try to parse directory listing
+            auth = None
+            if self.username and self.password:
+                auth = (self.username, self.password)
+            response = requests.get(url, timeout=30, auth=auth)
+            if response.status_code == 200:
+                import re
+                # Simple pattern to find links to model files
+                for ext in model_extensions:
+                    pattern = rf'href=["\']([^"\']*\.{ext})["\']'
+                    matches = re.findall(pattern, response.text, re.IGNORECASE)
+                    for match in matches:
+                        file_url = match if match.startswith('http') else url.rstrip('/') + '/' + match.lstrip('/')
+                        filename = os.path.basename(file_url.split('?')[0])
+                        size = self.get_file_size(file_url)
+                        files.append((filename, file_url, size))
+        except:
+            pass
+
+        return files
+
+    def collect_all_download_tasks(self, lines, force_redownload):
+        """
+        Collect all files that need to be downloaded.
+        Returns list of dicts with: folder, filename, url, dest_path, size
+        """
+        tasks = []
+
+        for line in lines:
+            result = self.parse_url_entry(line)
+            if not result:
+                continue
+
+            folder, url, custom_filename = result
+            dest_dir = self.get_model_dir(folder)
+
+            if self.is_folder_url(url):
+                # Folder - get all files from it
+                folder_files = self.get_folder_files_listing(url)
+                for filename, file_url, size in folder_files:
+                    dest_path = dest_dir / filename
+                    if not dest_path.exists() or force_redownload:
+                        tasks.append({
+                            'folder': folder,
+                            'filename': filename,
+                            'url': file_url,
+                            'dest_path': dest_path,
+                            'size': size,
+                            'is_folder_item': True
+                        })
+            else:
+                # Single file
+                filename = custom_filename if custom_filename else self.get_filename_from_url(url)
+                dest_path = dest_dir / filename
+                if not dest_path.exists() or force_redownload:
+                    size = self.get_file_size(url)
+                    tasks.append({
+                        'folder': folder,
+                        'filename': filename,
+                        'url': url,
+                        'dest_path': dest_path,
+                        'size': size,
+                        'is_folder_item': False
+                    })
+
+        return tasks
+
+    def download_file_with_temp(self, url, dest_path, progress_callback=None):
         """
         Download a file to a temporary location and move it to the destination on success.
         This prevents partial/corrupted files from appearing as valid downloads.
         """
+        # Check for cancellation
+        if self.check_interruption():
+            print(f"  ⚠ Download cancelled")
+            return False
+
         # Create a temporary file in the same directory as the destination
         # This ensures we're on the same filesystem for atomic rename
         dest_dir = dest_path.parent
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         temp_file = None
+        process = None
         try:
             # Create temp file with a unique name in the destination directory
             with tempfile.NamedTemporaryFile(
@@ -122,12 +237,12 @@ class ModelDownloader:
             print(f"  → Downloading to temporary file...")
 
             # Try aria2c first (faster, multi-connection)
-            success = self.download_with_aria2c(url, temp_file)
+            success, process = self.download_with_aria2c(url, temp_file, progress_callback)
 
             # Fall back to wget if aria2c is not available
             if success is None:
                 print(f"  → aria2c not found, falling back to wget...")
-                success = self.download_with_wget(url, temp_file)
+                success, process = self.download_with_wget(url, temp_file, progress_callback)
 
             if success:
                 # Verify the downloaded file is not empty
@@ -144,7 +259,21 @@ class ModelDownloader:
                 return False
 
         except Exception as e:
-            print(f"  ✗ Error during download: {e}")
+            if self.cancel_requested:
+                print(f"  ⚠ Download cancelled")
+            else:
+                print(f"  ✗ Error during download: {e}")
+
+            # Kill the download process if it's still running
+            if process:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except:
+                    try:
+                        process.kill()
+                    except:
+                        pass
             return False
         finally:
             # Clean up temp file if it still exists
@@ -154,10 +283,10 @@ class ModelDownloader:
                 except:
                     pass
 
-    def download_with_aria2c(self, url, dest_path):
+    def download_with_aria2c(self, url, dest_path, progress_callback=None):
         """Download using aria2c (fast, multi-connection)."""
         try:
-            result = subprocess.run([
+            cmd = [
                 'aria2c',
                 '-x', '16',  # 16 connections
                 '-s', '16',  # 16 segments
@@ -168,37 +297,93 @@ class ModelDownloader:
                 '--timeout=60',
                 '--allow-overwrite=true',
                 '--auto-file-renaming=false',
+            ]
+
+            # Add authentication if provided
+            if self.username and self.password:
+                cmd.extend(['--http-user', self.username])
+                cmd.extend(['--http-passwd', self.password])
+
+            cmd.extend([
                 '-o', dest_path.name,
                 '-d', str(dest_path.parent),
                 url
-            ], check=True, capture_output=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"  aria2c error: {e}")
-            return False
-        except FileNotFoundError:
-            return None  # Signal to try wget
+            ])
 
-    def download_with_wget(self, url, dest_path):
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # Wait for completion while checking for cancellation
+            while process.poll() is None:
+                if self.check_interruption():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return False, process
+                # Small sleep to avoid busy waiting
+                import time
+                time.sleep(0.1)
+
+            if process.returncode == 0:
+                return True, process
+            else:
+                print(f"  aria2c error: return code {process.returncode}")
+                return False, process
+        except FileNotFoundError:
+            return None, None  # Signal to try wget
+        except Exception as e:
+            print(f"  aria2c exception: {e}")
+            return False, None
+
+    def download_with_wget(self, url, dest_path, progress_callback=None):
         """Download using wget."""
         try:
-            result = subprocess.run([
+            cmd = [
                 'wget',
                 '-c',  # continue
                 '-t', '3',  # 3 retries
                 '--timeout=30',
                 '--read-timeout=30',
                 '--progress=bar:force',
+            ]
+
+            # Add authentication if provided
+            if self.username and self.password:
+                cmd.extend(['--user', self.username])
+                cmd.extend(['--password', self.password])
+
+            cmd.extend([
                 url,
                 '-O', str(dest_path)
-            ], check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"  wget error: {e}")
-            return False
+            ])
+
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # Wait for completion while checking for cancellation
+            while process.poll() is None:
+                if self.check_interruption():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return False, process
+                # Small sleep to avoid busy waiting
+                import time
+                time.sleep(0.1)
+
+            if process.returncode == 0:
+                return True, process
+            else:
+                print(f"  wget error: return code {process.returncode}")
+                return False, process
         except FileNotFoundError:
             print(f"  Error: wget not found. Please install wget or aria2c.")
-            return False
+            return False, None
+        except Exception as e:
+            print(f"  wget exception: {e}")
+            return False, None
 
     def download_folder(self, url, dest_dir, recursive=False, force_redownload=False):
         """
@@ -388,8 +573,13 @@ class ModelDownloader:
             else:
                 return 0, 0, 1
 
-    def download_models(self, model_list, concurrent_downloads, force_redownload, recursive_download, disable_download):
+    def download_models(self, model_list, concurrent_downloads, force_redownload, recursive_download, disable_download, username="", password=""):
         """Main function to process and download models."""
+
+        # Reset cancellation flag and set credentials
+        self.cancel_requested = False
+        self.username = username
+        self.password = password
 
         if disable_download:
             return ("Downloads disabled by user",)
@@ -402,63 +592,128 @@ class ModelDownloader:
             return ("No models to download",)
 
         print(f"\n{'='*60}")
-        print(f"Model Downloader - Processing {len(lines)} entries")
-        print(f"Concurrent downloads: {concurrent_downloads}")
-        print(f"Force redownload: {force_redownload}")
-        print(f"Recursive download: {recursive_download}")
+        print(f"Model Downloader - Collecting file listings...")
         print(f"{'='*60}\n")
 
-        # Thread-safe printing
+        # Phase 1: Collect all download tasks
+        try:
+            tasks = self.collect_all_download_tasks(lines, force_redownload)
+        except Exception as e:
+            print(f"✗ Error collecting download tasks: {e}")
+            return ("Failed to collect download tasks",)
+
+        if not tasks:
+            print("No files to download (all files already exist)")
+            return ("No files to download",)
+
+        # Print full file listing
+        print(f"\n{'='*60}")
+        print(f"Files to download: {len(tasks)}")
+        print(f"{'='*60}")
+        total_size = sum(task['size'] for task in tasks)
+        for i, task in enumerate(tasks, 1):
+            size_mb = task['size'] / (1024 * 1024) if task['size'] > 0 else 0
+            size_str = f"{size_mb:.2f} MB" if size_mb > 0 else "unknown size"
+            print(f"{i}. {task['filename']} ({size_str})")
+            print(f"   → {task['folder']}")
+        print(f"\nTotal size: {total_size / (1024 * 1024):.2f} MB")
+        print(f"Concurrent downloads: {concurrent_downloads}")
+        print(f"{'='*60}\n")
+
+        # Phase 2: Initialize progress bar
+        self.progress_bar = comfy.utils.ProgressBar(len(tasks))
+
+        # Thread-safe printing and progress tracking
         print_lock = threading.Lock()
+        progress_lock = threading.Lock()
+        completed_count = [0]  # Use list for mutable counter
 
         # Total counters
         total_success = 0
-        total_skip = 0
         total_fail = 0
 
-        # Use ThreadPoolExecutor for concurrent downloads
-        if concurrent_downloads == 1:
-            # Sequential processing (no threading overhead)
-            for line in lines:
-                success, skip, fail = self.process_single_download(
-                    line, force_redownload, recursive_download, print_lock
-                )
-                total_success += success
-                total_skip += skip
-                total_fail += fail
-        else:
-            # Concurrent processing
-            with ThreadPoolExecutor(max_workers=concurrent_downloads) as executor:
-                # Submit all download tasks
-                futures = {
-                    executor.submit(
-                        self.process_single_download,
-                        line,
-                        force_redownload,
-                        recursive_download,
-                        print_lock
-                    ): line for line in lines
-                }
+        def download_single_task(task, task_index):
+            """Download a single file and update progress."""
+            nonlocal total_success, total_fail
 
-                # Collect results as they complete
-                for future in as_completed(futures):
-                    try:
-                        success, skip, fail = future.result()
-                        total_success += success
-                        total_skip += skip
-                        total_fail += fail
-                    except Exception as e:
-                        with print_lock:
-                            print(f"✗ Unexpected error: {e}")
+            if self.cancel_requested:
+                return False
+
+            with print_lock:
+                print(f"\n[{task_index + 1}/{len(tasks)}] Downloading: {task['filename']}")
+                print(f"  Target folder: {task['folder']}")
+                print(f"  Destination: {task['dest_path']}")
+
+            # Download the file
+            success = self.download_file_with_temp(task['url'], task['dest_path'])
+
+            # Update progress
+            with progress_lock:
+                completed_count[0] += 1
+                self.progress_bar.update_absolute(completed_count[0], len(tasks))
+
+            return success
+
+        # Phase 3: Download files
+        try:
+            if concurrent_downloads == 1:
+                # Sequential processing
+                for i, task in enumerate(tasks):
+                    if self.cancel_requested:
+                        print("\n⚠ Download cancelled by user")
+                        break
+
+                    success = download_single_task(task, i)
+                    if success:
+                        total_success += 1
+                    else:
                         total_fail += 1
+            else:
+                # Concurrent processing
+                with ThreadPoolExecutor(max_workers=concurrent_downloads) as executor:
+                    # Submit all download tasks
+                    futures = {
+                        executor.submit(download_single_task, task, i): (task, i)
+                        for i, task in enumerate(tasks)
+                    }
+
+                    # Collect results as they complete
+                    for future in as_completed(futures):
+                        if self.cancel_requested:
+                            # Cancel remaining tasks
+                            for f in futures:
+                                f.cancel()
+                            print("\n⚠ Download cancelled by user")
+                            break
+
+                        try:
+                            success = future.result()
+                            if success:
+                                total_success += 1
+                            else:
+                                total_fail += 1
+                        except Exception as e:
+                            with print_lock:
+                                print(f"✗ Unexpected error: {e}")
+                            total_fail += 1
+
+        except KeyboardInterrupt:
+            print("\n⚠ Download interrupted")
+            self.cancel_requested = True
+        except Exception as e:
+            print(f"\n✗ Unexpected error during downloads: {e}")
 
         # Summary
-        print(f"{'='*60}")
+        print(f"\n{'='*60}")
         print(f"Download Summary:")
         print(f"  ✓ Successfully downloaded: {total_success}")
-        print(f"  → Skipped (already exists): {total_skip}")
         print(f"  ✗ Failed: {total_fail}")
+        if self.cancel_requested:
+            print(f"  ⚠ Cancelled: {len(tasks) - total_success - total_fail}")
         print(f"{'='*60}\n")
 
-        status = f"Downloaded: {total_success}, Skipped: {total_skip}, Failed: {total_fail}"
+        status = f"Downloaded: {total_success}, Failed: {total_fail}"
+        if self.cancel_requested:
+            status += f", Cancelled: {len(tasks) - total_success - total_fail}"
+
         return (status,)
