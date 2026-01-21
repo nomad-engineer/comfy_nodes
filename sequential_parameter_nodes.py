@@ -25,8 +25,8 @@ class Sequential_Parameter_Loader:
             }
         }
 
-    RETURN_TYPES = (any_type, any_type, "STRING", "STRING", "SEQUENTIAL_PARAMETER_TRIGGER",)
-    RETURN_NAMES = ("x", "y", "x_label", "y_label", "to trigger",)
+    RETURN_TYPES = (any_type, any_type, "STRING", "STRING", "STRING", "SEQUENTIAL_PARAMETER_TRIGGER",)
+    RETURN_NAMES = ("x", "y", "x_label", "y_label", "filename", "to trigger",)
     FUNCTION = "load_next_parameters"
     CATEGORY = "my_nodes"
     OUTPUT_NODE = False
@@ -38,7 +38,7 @@ class Sequential_Parameter_Loader:
             os.makedirs(dir_name, exist_ok=True)
         state = {
             "current_index": self.current_index,
-            "last_file_path": getattr(self, "last_file_path", "")
+            "last_filename": getattr(self, "last_filename", "")
         }
         try:
             with open(file_path, "w") as f:
@@ -113,7 +113,12 @@ class Sequential_Parameter_Loader:
 
         self.total_combinations = total_combinations
 
-        return (val_x, val_y, lbl_x, lbl_y, self,)
+        # Generate combined filename from labels
+        labels_to_join = [l for l in [lbl_x, lbl_y] if l]
+        filename = "__".join(labels_to_join)
+        self.last_filename = filename
+
+        return (val_x, val_y, lbl_x, lbl_y, filename, self,)
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -128,9 +133,11 @@ class Sequential_Parameter_Trigger:
                     "trigger": (any_type,),
                     "from_loader": ("SEQUENTIAL_PARAMETER_TRIGGER",),
                     "auto_submit_workflow": ("BOOLEAN", {"default": True}),
-                    "file_path": ("STRING", {"default": '', "multiline": False}),
-                    }
+                    },
+                "optional": {
+                    "filename": ("STRING", {"forceInput": True}),
                 }
+            }
 
     FUNCTION = "doit"
     CATEGORY = "my_nodes"
@@ -138,18 +145,22 @@ class Sequential_Parameter_Trigger:
     RETURN_NAMES = ("trigger_pass_through",)
     OUTPUT_NODE = True
 
-    def doit(self, trigger, from_loader, auto_submit_workflow, file_path):
+    def doit(self, trigger, from_loader, auto_submit_workflow, filename=None):
         loader = from_loader
         loader.current_index += 1
-        loader.last_file_path = file_path
         
-        print(f"Sequential Trigger: Index {loader.current_index}/{loader.total_combinations}, Auto-Submit: {auto_submit_workflow}")
+        # Determine filename to save: use provided one if not empty, otherwise from loader
+        final_filename = filename if filename else getattr(loader, "last_filename", "")
+        loader.last_filename = final_filename
+        
+        print(f"Sequential Trigger: Index {loader.current_index}/{loader.total_combinations}, Filename: {final_filename}, Auto-Submit: {auto_submit_workflow}")
 
         if loader.current_index < loader.total_combinations:
             loader._save_state(loader.batch_file_path)
             if auto_submit_workflow:
-                print("Sequential Trigger: Sending auto-submit signal (impact-add-queue)")
+                print("Sequential Trigger: Sending auto-submit signal")
                 PromptServer.instance.send_sync("impact-add-queue", {})
+                PromptServer.instance.send_sync("execution_start", {"node_id": "sequential_parameter_trigger"}) 
         else:
             # We reached the end of the batch
             if loader.restart_at_batch_end:
@@ -157,8 +168,9 @@ class Sequential_Parameter_Trigger:
                 loader._save_state(loader.batch_file_path)
                 print("Sequential Parameter Sweep Finished - Re-starting from beginning")
                 if auto_submit_workflow:
-                    print("Sequential Trigger: Sending auto-submit signal (impact-add-queue) for restart")
+                    print("Sequential Trigger: Sending auto-submit signal for restart")
                     PromptServer.instance.send_sync("impact-add-queue", {})
+                    PromptServer.instance.send_sync("execution_start", {"node_id": "sequential_parameter_trigger"})
             else:
                 # Stay at the end index so the loader can "prompt" on next run
                 loader._save_state(loader.batch_file_path)
@@ -217,43 +229,102 @@ class Lora_List_From_Path:
     CATEGORY = "my_nodes"
 
     def generate_list(self, base_path, recursion_depth, include, exclude):
-        import fnmatch
         import re
+        import folder_paths
         
-        if not base_path:
-            # If no base path, maybe use default lora path?
-            import folder_paths
-            base_path = folder_paths.get_folder_paths("loras")[0]
-
-        if not os.path.exists(base_path):
-            return ("",)
+        # Get the standard ComfyUI lora list (paths relative to lora folder)
+        all_loras = folder_paths.get_filename_list("loras")
+        
+        print(f"Lora List From Path: Filtering {len(all_loras)} total loras for path: '{base_path}', inc: '{include}', exc: '{exclude}'")
 
         loras = []
-        base_path_obj = Path(base_path)
         
-        # Regex search
+        def get_regex_from_comma_string(s):
+            if not s or s == "*":
+                return None
+            # Split by comma, strip whitespace, and create an OR regex
+            parts = [re.escape(p.strip()) for p in s.split(",") if p.strip()]
+            if not parts:
+                return None
+            return re.compile("|".join(parts), re.IGNORECASE)
+
+        # Regex search patterns
         try:
-            include_re = re.compile(include) if include != "*" else None
-            exclude_re = re.compile(exclude) if exclude else None
-        except re.error:
-            print(f"Invalid regex: {include} or {exclude}")
+            include_re = get_regex_from_comma_string(include)
+            exclude_re = get_regex_from_comma_string(exclude)
+        except re.error as e:
+            print(f"Lora List From Path: Invalid regex construction: {e}")
             return ("",)
 
-        for root, dirs, files in os.walk(base_path):
-            # Calculate current depth
-            depth = Path(root).relative_to(base_path_obj).parts
-            if len(depth) > recursion_depth:
-                dirs[:] = [] # stop recursing
+        found_count = 0
+        include_count = 0
+        exclude_count = 0
+
+        for rel_file in all_loras:
+            # First, check if the lora is within the specified 'base_path' (substring match)
+            if base_path and base_path not in rel_file:
                 continue
             
-            for file in files:
-                if file.endswith((".safetensors", ".ckpt", ".pt")):
-                    rel_file = os.path.relpath(os.path.join(root, file), base_path)
-                    
-                    # Check include
-                    if include == "*" or include_re.search(rel_file):
-                        # Check exclude
-                        if not exclude_re or not exclude_re.search(rel_file):
-                            loras.append(rel_file)
+            # Depth check
+            path_to_check = rel_file
+            if base_path:
+                parts = rel_file.split(base_path, 1)
+                path_to_check = parts[1].lstrip('/\\')
+            
+            current_depth = len(Path(path_to_check).parent.parts) if path_to_check else 0
+            if current_depth > recursion_depth:
+                continue
 
-        return ("\n".join(loras),)
+            found_count += 1
+            
+            # Check include (if include is empty or *, it matches all)
+            passes_include = True
+            if include_re:
+                passes_include = bool(include_re.search(rel_file))
+            
+            if passes_include:
+                include_count += 1
+                # Check exclude
+                is_excluded = False
+                if exclude_re:
+                    is_excluded = bool(exclude_re.search(rel_file))
+                
+                if not is_excluded:
+                    loras.append(rel_file)
+                else:
+                    exclude_count += 1
+
+        if len(loras) > 0:
+            print(f"--- Found {len(loras)} Lora Paths ---")
+            
+            # Generate labels
+            labels = []
+            for l in loras:
+                # Remove extension
+                label = os.path.splitext(l)[0]
+                # Replace '/' with '_'
+                label = label.replace('/', '_').replace('\\', '_')
+                labels.append(label)
+            
+            # Find and remove common prefix
+            if len(labels) > 1:
+                # Find common prefix using os.path.commonprefix on the parts
+                # Actually, simpler to check strings if we are consistent
+                common = os.path.commonprefix(labels)
+                if common:
+                    # Only remove if it ends with a separator-turned-underscore for safety
+                    # Or just remove what is common to keep it short as requested
+                    labels = [l[len(common):] if l.startswith(common) else l for l in labels]
+            
+            # Create the multiline output with labels
+            lines = []
+            for i in range(len(loras)):
+                lines.append(f"{loras[i]}, {labels[i]}")
+            
+            for l in lines:
+                print(f"  - {l}")
+            print("------------------------")
+            return ("\n".join(lines),)
+        else:
+            print("Lora List From Path: NO LORAS FOUND MATCHING CRITERIA")
+            return ("",)
