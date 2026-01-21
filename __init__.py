@@ -13,6 +13,7 @@ from .modelDownloader import ModelDownloader
 from .nodes2 import MyPipeAll, pipeAdd, pipeRead, pipeReadKeyword, Sequential_Image_Loader, \
       Sequential_Image_Loader_Trigger, control_net_stack_concat, conditioning_2, loader as loader2, loader_out, \
       hash_image, GetImageSize, loader_in
+from .sequential_parameter_nodes import Sequential_Parameter_Loader, Sequential_Parameter_Trigger, Lora_List, Lora_List_From_Path
 
 NODE_CLASS_MAPPINGS = {
          # From myCustomNodes
@@ -43,7 +44,11 @@ NODE_CLASS_MAPPINGS = {
          "Loader Out": loader_out,
          "Hash Image": hash_image,
          "Get Image Size": GetImageSize,
-         "Loader In": loader_in
+         "Loader In": loader_in,
+         "Sequential Parameter Loader": Sequential_Parameter_Loader,
+         "Sequential Parameter Trigger": Sequential_Parameter_Trigger,
+         "Lora List": Lora_List,
+         "Lora List From Path": Lora_List_From_Path
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -72,7 +77,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
       "Loader Out": "LoaderOut",
       "Hash Image": "Hash Image",
       "Get Image Size": "Get Image Size",
-      "Loader In": "Loader In"
+      "Loader In": "Loader In",
+      "Sequential Parameter Loader": "Sequential Parameter Loader",
+      "Sequential Parameter Trigger": "Sequential Parameter Trigger",
+      "Lora List": "Lora List",
+      "Lora List From Path": "Lora List From Path"
 }
 
 WEB_DIRECTORY = "./web"
